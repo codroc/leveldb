@@ -89,6 +89,7 @@ const char* GetVarint32PtrFallback(const char* p, const char* limit,
   for (uint32_t shift = 0; shift <= 28 && p < limit; shift += 7) {
     uint32_t byte = *(reinterpret_cast<const uint8_t*>(p));
     p++;
+    // 这里是小端序存储 varint 的
     if (byte & 128) {
       // More bytes are present
       result |= ((byte & 127) << shift);

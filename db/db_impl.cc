@@ -1197,6 +1197,9 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
   return DB::Delete(options, key);
 }
 
+// 对数据库进行一次变更
+// 不对 disk 进行 in-place write，而是直接往 内存表 中插入数据（在此之前做一下 WAL，放置数据丢失，用于故障恢复），之后可以 only-append 的方式仅追加到磁盘；
+// 大大提高写吞吐能力
 Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   Writer w(&mutex_);
   w.batch = updates;
@@ -1212,21 +1215,25 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     return w.status;
   }
 
+  // 如果是队列中的第一个，并且未完成: if !w.done && &w == writers_.front()
   // May temporarily unlock and wait.
   Status status = MakeRoomForWrite(updates == nullptr);
   uint64_t last_sequence = versions_->LastSequence();
   Writer* last_writer = &w;
   if (status.ok() && updates != nullptr) {  // nullptr batch is for compactions
-    WriteBatch* write_batch = BuildBatchGroup(&last_writer);
-    WriteBatchInternal::SetSequence(write_batch, last_sequence + 1);
+    WriteBatch* write_batch = BuildBatchGroup(&last_writer); // BuildBatchGroup 把许多 WriteBatch 整合为一个 WriteBatch
+    WriteBatchInternal::SetSequence(write_batch, last_sequence + 1); // 填充 WriteBatch 中的 seq 字段，aka. WriteBatch ID
     last_sequence += WriteBatchInternal::Count(write_batch);
 
+    // 关键的一步来了：
+    // 1. 写 log 2. 把数据插入 memtable
     // Add to log and apply to memtable.  We can release the lock
     // during this phase since &w is currently responsible for logging
     // and protects against concurrent loggers and concurrent writes
     // into mem_.
     {
       mutex_.Unlock();
+      // 1. WAL 添加一条日志记录，用于故障恢复
       status = log_->AddRecord(WriteBatchInternal::Contents(write_batch));
       bool sync_error = false;
       if (status.ok() && options.sync) {
@@ -1236,6 +1243,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
         }
       }
       if (status.ok()) {
+        // 2. 把数据插入 memtable
         status = WriteBatchInternal::InsertInto(write_batch, mem_);
       }
       mutex_.Lock();
@@ -1292,6 +1300,7 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
   *last_writer = first;
   std::deque<Writer*>::iterator iter = writers_.begin();
   ++iter;  // Advance past "first"
+  // 这里好像是要把 writer_ 中的 writebatch 放到一个 batch 里面去一起执行
   for (; iter != writers_.end(); ++iter) {
     Writer* w = *iter;
     if (w->sync && !first->sync) {
@@ -1334,6 +1343,8 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       break;
     } else if (allow_delay && versions_->NumLevelFiles(0) >=
                                   config::kL0_SlowdownWritesTrigger) {
+      // 如果 L0 层的 sstable 文件数量大于 kL0_SlowdownWritesTrigger 时，进行慢速写；
+      // 也就是让单个写操作 sleep 1000ms
       // We are getting close to hitting a hard limit on the number of
       // L0 files.  Rather than delaying a single write by several
       // seconds when we hit the hard limit, start delaying each
@@ -1349,6 +1360,8 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       // There is room in current memtable
       break;
     } else if (imm_ != nullptr) {
+        // 流程走到这一定满足:
+        // assert(force == true or (!allow_delay and no room in current memtable))
       // We have filled up the current memtable, but the previous
       // one is still being compacted, so we wait.
       Log(options_.info_log, "Current memtable full; waiting...\n");

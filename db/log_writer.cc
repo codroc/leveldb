@@ -61,6 +61,11 @@ Status Writer::AddRecord(const Slice& slice) {
 
     RecordType type;
     const bool end = (left == fragment_length);
+    // 根据 begin 和 end 来识别
+    // 1. 一条完整的记录
+    // 2. 第一条记录
+    // 3. 最后一条记录
+    // 4. 中间记录
     if (begin && end) {
       type = kFullType;
     } else if (begin) {
@@ -71,7 +76,7 @@ Status Writer::AddRecord(const Slice& slice) {
       type = kMiddleType;
     }
 
-    s = EmitPhysicalRecord(type, ptr, fragment_length);
+    s = EmitPhysicalRecord(type, ptr, fragment_length); // emitphysicalrecord 函数里面会 flush，因此这里可能很慢
     ptr += fragment_length;
     left -= fragment_length;
     begin = false;
@@ -79,13 +84,20 @@ Status Writer::AddRecord(const Slice& slice) {
   return s;
 }
 
+// 制作一条记录
+// record:
+//  crc: 4 bytes
+//  len: 2 bytes
+//  type: 1 byte
+//  data:
 Status Writer::EmitPhysicalRecord(RecordType t, const char* ptr,
                                   size_t length) {
-  assert(length <= 0xffff);  // Must fit in two bytes
+  assert(length <= 0xffff);  // Must fit in two bytes aka. <= 65536
   assert(block_offset_ + kHeaderSize + length <= kBlockSize);
 
   // Format the header
   char buf[kHeaderSize];
+  // 注意是网络字节序，length 是 2 个字节，因此要换下位置
   buf[4] = static_cast<char>(length & 0xff);
   buf[5] = static_cast<char>(length >> 8);
   buf[6] = static_cast<char>(t);

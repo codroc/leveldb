@@ -11,6 +11,7 @@
 
 namespace leveldb {
 
+// 这里会把 tag 和 key 结合在一起返回吗?
 static Slice GetLengthPrefixedSlice(const char* data) {
   uint32_t len;
   const char* p = data;
